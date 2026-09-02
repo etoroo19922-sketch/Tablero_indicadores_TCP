@@ -136,9 +136,11 @@ siempre los DH.
 
 **1. Supervisores por vuelo:** por cada leg único, se cuenta cuántos tripulantes de
 categoría SUPINT, SUPINTN o SUPNAL están asignados. Se agrupan los legs según si
-tienen 1, 2, 3 o más supervisores asignados. El % de cobertura de SUPINT se calcula
-como (legs con al menos un SUPINT o SUPINTN) / (total de legs) de ese continente;
-igual para SUPNAL.
+tienen 1, 2, 3 o más supervisores asignados (cuenta combinada de las tres categorías).
+El % de cobertura de SUPINT es (legs con al menos un SUPINT o SUPINTN) / (total de
+legs) de ese continente. El % de SUPNAL **solo cuenta los legs donde NO hay ya un
+supervisor internacional** — es decir, mide cuánto está cubriendo el SUPNAL como
+respaldo cuando no hay SUPINT/SUPINTN, no cuántos legs tienen un SUPNAL en general.
 
 **2. Vuelos por categoría:** cuenta cuántas asignaciones tripulante-leg hay por cada
 categoría y continente — viene directo del tx time, cruzado con la categoría de cada
@@ -199,7 +201,28 @@ if nlc_file is not None:
             "Puede que el archivo esté incompleto o truncado — vuelve a exportarlo."
         )
         st.stop()
+
+    # ---- Extraer periodo (FHDR) y nombre del archivo, para trazabilidad ----
+    fhdr_parts = lineas_nlc[0].split("|")
+    fecha_inicio_txt = fhdr_parts[1] if len(fhdr_parts) > 1 else "?"
+    fecha_fin_txt = fhdr_parts[2] if len(fhdr_parts) > 2 else "?"
+
+    def formatear_fecha_yyyymmdd(s):
+        if len(s) == 8 and s.isdigit():
+            return f"{s[6:8]}/{s[4:6]}/{s[0:4]}"
+        return s
+
+    periodo_txt = f"{formatear_fecha_yyyymmdd(fecha_inicio_txt)} — {formatear_fecha_yyyymmdd(fecha_fin_txt)}"
+    nombre_archivo_nlc = nlc_file.name
+
     st.success(f"✅ Tx time válido — {len(lineas_nlc):,} líneas leídas.")
+    st.info(
+        f"📄 **Archivo:** `{nombre_archivo_nlc}`  \n"
+        f"📅 **Periodo programado (según encabezado FHDR):** {periodo_txt}  \n\n"
+        f"⚠️ Confirma que este es el tx time del **periodo y escenario correcto** antes de continuar — "
+        f"si comparas el resultado contra un reporte de asignaciones u otro archivo, ambos deben "
+        f"corresponder a la misma fecha de generación."
+    )
 
 if lineas_nlc is None:
     st.info("⬆️ Sube el tx time para continuar.")
@@ -551,7 +574,10 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                 sup_dist[region]["3+"] += 1
             if cats.get("SUPINT", 0) + cats.get("SUPINTN", 0) > 0:
                 sup_con_supint[region] += 1
-            if cats.get("SUPNAL", 0) > 0:
+            elif cats.get("SUPNAL", 0) > 0:
+                # El SUPNAL solo cuenta como cobertura cuando NO hay ya un
+                # supervisor internacional (SUPINT/SUPINTN) en ese leg - es un
+                # respaldo, no una coincidencia con el supervisor internacional.
                 sup_con_supnal[region] += 1
 
         # ---- Seccion 3: especialistas por region x flota ----
@@ -639,6 +665,8 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         sc(f"B{row}", f"TABLERO DE INDICADORES — BASE {base}", TITLE_FONT)
         row += 1
         sc(f"B{row}", f"Generado {datetime.now().strftime('%Y-%m-%d %H:%M')} — DH excluidos de todos los cálculos", NOTE_FONT)
+        row += 1
+        sc(f"B{row}", f"Archivo tx time usado: {nombre_archivo_nlc}  |  Periodo programado (FHDR): {periodo_txt}", NOTE_FONT)
         row += 2
 
         # ---- Resumen operativo ----
@@ -668,7 +696,7 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         sc(f"B{row}", "1. SUPERVISORES POR VUELO — distribución y cobertura por continente", SECTION_FONT, SECTION_FILL)
         row += 1
         headers1 = ["CONTINENTE", "TOTAL LEGS", "LEGS 1 SUP.", "LEGS 2 SUP.", "LEGS 3+ SUP.",
-                    "LEGS SIN SUP.", "% COBERTURA SUPINT", "% COBERTURA SUPNAL"]
+                    "LEGS SIN SUP.", "% COBERTURA SUPINT", "% COBERTURA SUPNAL (respaldo)"]
         for i, h in enumerate(headers1):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
@@ -685,6 +713,26 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             sc(f"H{row}", sup_con_supint.get(region, 0) / tot, numfmt="0.0%")
             sc(f"I{row}", sup_con_supnal.get(region, 0) / tot, numfmt="0.0%")
             row += 1
+        # Fila de TOTAL (suma de todos los continentes)
+        tot_g = sum(sup_total_legs.values())
+        d1_g = sum(sup_dist[r].get(1, 0) for r in REGIONES_ORDEN)
+        d2_g = sum(sup_dist[r].get(2, 0) for r in REGIONES_ORDEN)
+        d3_g = sum(sup_dist[r].get("3+", 0) for r in REGIONES_ORDEN)
+        sin_g = sum(sup_sin_ninguno.values())
+        supint_g = sum(sup_con_supint.values())
+        supnal_g = sum(sup_con_supnal.values())
+        sc(f"B{row}", "TOTAL (todos los continentes)", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"C{row}", tot_g, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"D{row}", d1_g, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"E{row}", d2_g, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"F{row}", d3_g, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"G{row}", sin_g, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"H{row}", (supint_g / tot_g) if tot_g else None, LABEL_FONT, NEUTRAL_FILL, "0.0%")
+        sc(f"I{row}", (supnal_g / tot_g) if tot_g else None, LABEL_FONT, NEUTRAL_FILL, "0.0%")
+        row += 1
+        sc(f"B{row}", "Nota: %SUPNAL solo cuenta los legs donde NO hay ya un supervisor internacional "
+                      "(SUPINT/SUPINTN) — es decir, SUPNAL cubre como respaldo. Por eso %SUPINT + %SUPNAL + "
+                      "(LEGS SIN SUP./TOTAL) = 100% en cada continente.", NOTE_FONT)
         row += 2
 
         # ---- Seccion 2: Vuelos por categoria x continente ----
