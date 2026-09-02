@@ -1,18 +1,24 @@
 """
-GENERADOR DE TABLERO DE INDICADORES - TRIPULACION POR BASE
-============================================================
+GENERADOR DE TABLERO DE INDICADORES - TRIPULACION POR BASE  (v2)
+====================================================================
 App web (Streamlit) que guía al usuario paso a paso:
   1) Elegir la base a procesar
   2) Cargar cada archivo requerido, EN ORDEN, con validación inmediata
-     (si algo falta o está mal, explica exactamente qué corregir)
   3) Generar y descargar el tablero de indicadores en Excel
 
-CÓMO EJECUTARLA (para el equipo de TI / quien la despliegue):
-  1) Instalar dependencias:  pip install streamlit pandas openpyxl xlrd
-  2) Ejecutar:               streamlit run generador_tablero_app.py
-  3) Se abre en el navegador (local: http://localhost:8501). Para que la use
-     todo el equipo, se despliega en un servidor interno o en Streamlit
-     Community Cloud / similar, y se comparte el link.
+NOVEDADES v2:
+  - Excluye los DH (registros PFTR/RFTR en el tx time) de todos los cálculos
+  - Clasificación por continente/región en vez de solo Europa/Internacional/Nacional:
+    Norteamérica (USA+Canadá), Centroamérica (incl. México), Caribe, Suramérica,
+    Europa, Otro Continente (preparado para AUH - Abu Dhabi - desde octubre), Nacional
+  - Resumen operativo: total de legs de la base y total de Block Hours de la base
+  - Supervisores: distribución de legs con 1/2/3+ supervisores, y % de cobertura
+    de SUPINT y de SUPNAL por separado, todo por continente
+  - Especialistas: cobertura cruzada por continente Y por flota (787/330/320)
+  - Viáticos y Block Time: incluye el tripulante con el valor más bajo y más alto
+    de cada categoría (solo ESTADO = LINEA)
+  - Cada sección trae una explicación breve de cómo se calcula y de dónde sale
+    la información
 
 Autor: generado con Claude a partir del proceso ya validado manualmente.
 """
@@ -29,16 +35,57 @@ import io
 st.set_page_config(page_title="Generador de Tablero por Base", layout="centered")
 
 # =========================================================================
-# CONSTANTES DE NEGOCIO (mismas reglas ya validadas en el proceso manual)
+# CONSTANTES DE NEGOCIO
 # =========================================================================
 AEROPUERTOS_COLOMBIA = {
     "ADZ", "AXM", "BAQ", "BGA", "BOG", "CLO", "CTG", "CUC", "IBE", "IPI",
     "LET", "MDE", "MTR", "NVA", "PEI", "PPN", "PSO", "RCH", "SMR", "VUP",
 }
 AEROPUERTOS_EUROPA = {"BCN", "CDG", "LHR", "MAD"}
+AEROPUERTOS_NORTEAMERICA = {"BOS", "DFW", "FLL", "IAD", "JFK", "MCO", "MIA", "ORD", "TPA", "YUL", "YYZ"}
+AEROPUERTOS_CENTROAMERICA = {"GUA", "SAL", "PTY", "MEX", "MTY", "CUN"}  # incluye Mexico, por decision del usuario
+AEROPUERTOS_CARIBE = {"PUJ", "SDQ", "SJU", "AUA", "CUR", "HAV"}
+AEROPUERTOS_SURAMERICA = {
+    "ASU", "EZE", "AEP", "GIG", "GRU", "GYE", "UIO", "LIM", "LPB", "MVD",
+    "SCL", "VVI", "GEO", "COR", "BEL", "MAO", "CUZ", "VLN", "MAR",
+}
+AEROPUERTOS_OTRO_CONTINENTE = {"AUH"}  # Abu Dhabi (Emiratos Arabes Unidos) - entra en octubre 2026
+
+REGIONES_ORDEN = ["NORTEAMERICA", "CENTROAMERICA", "CARIBE", "SURAMERICA", "EUROPA", "OTRO_CONTINENTE", "NACIONAL"]
+REGIONES_LABEL = {
+    "NORTEAMERICA": "Norteamérica (USA y Canadá)",
+    "CENTROAMERICA": "Centroamérica (incl. México)",
+    "CARIBE": "Caribe",
+    "SURAMERICA": "Suramérica",
+    "EUROPA": "Europa",
+    "OTRO_CONTINENTE": "Otro Continente (ej. AUH)",
+    "NACIONAL": "Nacional",
+}
+
 CODIGOS_ESPECIALES = {"ILLP", "VAC", "LUS", "OFI", "PSI", "XMTR", "MAT", "XMAT", "OFFICE_M"}
 CATEGORIAS_ORDEN = ["SUPINT", "SUPINTN", "INTNAL", "SUPNAL", "AUXNAL"]  # de mas antiguo a mas reciente
 BASES_VALIDAS = ["BOG", "MDE", "CLO", "BAQ", "CTG", "PEI", "BGA"]
+
+
+def region_aeropuerto(aeropuerto):
+    """Clasifica un aeropuerto en su region/continente. Devuelve 'SIN_CLASIFICAR'
+    si no esta en ninguna lista conocida, para poder detectarlo y avisar."""
+    a = aeropuerto.strip().upper()
+    if a in AEROPUERTOS_COLOMBIA:
+        return "NACIONAL"
+    if a in AEROPUERTOS_EUROPA:
+        return "EUROPA"
+    if a in AEROPUERTOS_NORTEAMERICA:
+        return "NORTEAMERICA"
+    if a in AEROPUERTOS_CENTROAMERICA:
+        return "CENTROAMERICA"
+    if a in AEROPUERTOS_CARIBE:
+        return "CARIBE"
+    if a in AEROPUERTOS_SURAMERICA:
+        return "SURAMERICA"
+    if a in AEROPUERTOS_OTRO_CONTINENTE:
+        return "OTRO_CONTINENTE"
+    return "SIN_CLASIFICAR"
 
 
 def fleet_group(equip):
@@ -73,9 +120,48 @@ st.title("📊 Generador de Tablero de Indicadores — Tripulación por Base")
 st.markdown(
     "Esta herramienta procesa el tx time, el reporte KPI, ESTADOS, la planta, "
     "la lista de vuelos/flota y la lista de especialistas, y genera el tablero "
-    "de indicadores para la base que elijas. Sube los archivos **en el orden pedido**; "
+    "de indicadores para la base que elijas. **Los DH (deadhead) se excluyen "
+    "automáticamente de todos los cálculos.** Sube los archivos en el orden pedido; "
     "cada uno se valida antes de dejarte avanzar."
 )
+
+with st.expander("ℹ️ ¿Cómo se calcula cada indicador? (léelo antes de empezar)"):
+    st.markdown("""
+**Resumen operativo (Block Hours y legs por flota):** las Block Hours son las horas
+de bloque de todos los tripulantes en estado LINEA, tomadas del reporte KPI. Los legs
+se cuentan de forma única (fecha + vuelo + aeropuerto) — si un vuelo tiene 7
+tripulantes asignados, sigue contando como **1 solo leg**, no como 7. Se desglosan
+por flota (avión) cruzando el número de vuelo con la Flight List, y se excluyen
+siempre los DH.
+
+**1. Supervisores por vuelo:** por cada leg único, se cuenta cuántos tripulantes de
+categoría SUPINT, SUPINTN o SUPNAL están asignados. Se agrupan los legs según si
+tienen 1, 2, 3 o más supervisores asignados. El % de cobertura de SUPINT se calcula
+como (legs con al menos un SUPINT o SUPINTN) / (total de legs) de ese continente;
+igual para SUPNAL.
+
+**2. Vuelos por categoría:** cuenta cuántas asignaciones tripulante-leg hay por cada
+categoría y continente — viene directo del tx time, cruzado con la categoría de cada
+tripulante (columna CATEGORIA de la planta).
+
+**3. Especialistas:** por cada leg único, se determina su continente (según el
+aeropuerto de destino) y su flota (según el número de vuelo, cruzado con la Flight
+List). El % de cobertura es (legs con al menos un especialista asignado) / (total de
+legs) para cada combinación continente × flota.
+
+**4. Viáticos (Allowances):** promedio, target, mínimo y máximo tomados del reporte
+KPI (columnas ALLOWANCES y TARGET ALLOWANCES), filtrando solo tripulantes con
+ESTADO = LINEA (con la validación de estado aplicada — ver más abajo). Se identifica
+por nombre a quien tiene el valor más bajo y más alto de cada categoría.
+
+**5. Block Time:** mismo tratamiento que Viáticos, pero con las columnas BLOCK HOURS
+y TARGET PER DIEM del reporte KPI (convertidas de HH:MM a horas decimales).
+
+**Validación de estado:** revisa el tx time en busca de tripulantes marcados
+"LINEA" en el archivo de ESTADOS que en realidad tengan días con código ILLP, VAC,
+LUS, OFI, PSI, XMTR, MAT, XMAT u OFFICE_M — si los tiene, se usa ese código real en
+vez de LINEA, y por lo tanto queda excluido de los cálculos de Viáticos y Block Time.
+    """)
 
 base = st.selectbox("1️⃣ Elige la BASE a procesar", BASES_VALIDAS)
 st.divider()
@@ -351,7 +437,7 @@ st.subheader("8️⃣ Generar tablero")
 if st.button("🚀 Generar tablero de indicadores", type="primary"):
     with st.spinner("Parseando el tx time y calculando indicadores... esto puede tardar 1-2 minutos"):
 
-        # ---- Parsear el tx time ----
+        # ---- Parsear el tx time (excluyendo DH: PFTR / RFTR) ----
         boundary = None
         for i, l in enumerate(lineas_nlc):
             if l.startswith(("RABS", "RPRG", "RROL", "RFTR")):
@@ -366,7 +452,8 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             p = l.split("|")
             if p[0] == "PPRG" and len(p) > 14:
                 cur_nl = p[14]
-            elif p[0] in ("PLEG", "PFTR") and cur_nl and len(p) > 3:
+            elif p[0] == "PLEG" and cur_nl and len(p) > 3:
+                # PLEG = leg operado. PFTR (DH) se ignora a proposito.
                 nl_flights[cur_nl].append((p[1], p[2].strip(), p[3].strip()))
 
         crew_legs = defaultdict(list)
@@ -387,9 +474,8 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                     for ev in nl_flights.get(q[3], []):
                         crew_legs[cur_crew].append(ev)
             elif tipo == "RFTR":
+                # RFTR = DH del tripulante. Se ignora a proposito.
                 cur_crew = q[1]
-                if len(q) > 5:
-                    crew_legs[cur_crew].append((q[3], q[4].strip(), q[5].strip()))
             elif tipo == "RROL":
                 cur_crew = q[1]
                 if len(q) > 5 and q[2] == "L":
@@ -403,12 +489,10 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         # ---- Mapa de homebase preferente: KPI, con respaldo en planta ----
         kpi_homebase_map = dict(zip(kpi_df["CREW ID"], kpi_df["HOMEBASE"]))
 
-        def clasif_final(clasif, europa):
-            return "NACIONAL" if clasif == "NACIONAL" else ("EUROPA" if europa == "EUROPA" else "AMERICA")
-
         # ---- Recorrer legs y construir indicadores ----
-        leg_map = {}  # (fecha,vuelo,aeropuerto) -> {tipo, flota, cats:set, esp:bool}
-        cat_legs = Counter()  # (categoria, tipo) -> n
+        leg_map = {}  # (fecha,vuelo,aeropuerto) -> {region, flota, cat_counts:Counter, esp:bool}
+        cat_legs = Counter()  # (categoria, region) -> n asignaciones tripulante-leg
+        aeropuertos_sin_clasificar = set()
 
         for crew_id, legs in crew_legs.items():
             info = crew_info.get(crew_id)
@@ -421,14 +505,11 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             es_esp = crew_id in especialista_set
 
             for fecha, vuelo, aeropuerto in legs:
-                if aeropuerto in AEROPUERTOS_COLOMBIA:
-                    clasif = "NACIONAL"
-                elif aeropuerto in AEROPUERTOS_EUROPA:
-                    clasif = "EUROPA"
-                else:
-                    clasif = "AMERICA"
+                region = region_aeropuerto(aeropuerto)
+                if region == "SIN_CLASIFICAR":
+                    aeropuertos_sin_clasificar.add(aeropuerto)
 
-                cat_legs[(categoria, clasif)] += 1
+                cat_legs[(categoria, region)] += 1
 
                 leg_key = (fecha, vuelo, aeropuerto)
                 if leg_key not in leg_map:
@@ -437,35 +518,52 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                     except (IndexError, ValueError):
                         num_vuelo = None
                     flota = flt_flota.get(num_vuelo, "OTRO")
-                    leg_map[leg_key] = {"tipo": clasif, "flota": flota, "cats": set(), "esp": False}
-                leg_map[leg_key]["cats"].add(categoria)
+                    leg_map[leg_key] = {"region": region, "flota": flota, "cat_counts": Counter(), "esp": False}
+                leg_map[leg_key]["cat_counts"][categoria] += 1
                 if es_esp:
                     leg_map[leg_key]["esp"] = True
 
-        # ---- Seccion 1 y 3 desde leg_map ----
-        leg_totals = Counter()
-        leg_sin_sup = Counter()
-        esp_tot_d = Counter()
-        esp_cov_d = Counter()
-        esp_tot_f = Counter()
-        esp_cov_f = Counter()
+        # ---- Resumen operativo: total legs y block hours de la base ----
+        total_legs_base = len(leg_map)
+        # Legs unicos por flota (avion) — cada leg (fecha+vuelo+aeropuerto) cuenta 1 sola vez
+        # sin importar cuantos tripulantes tenga asignados, y sin contar los DH.
+        legs_por_flota = Counter(d["flota"] for d in leg_map.values())
+
+        # ---- Seccion 1: supervisores (distribucion 1/2/3+ y cobertura SUPINT/SUPNAL) por region ----
+        sup_dist = defaultdict(Counter)      # region -> {1:n legs con 1 sup, 2:.., '3+':..}
+        sup_total_legs = Counter()           # region -> total legs
+        sup_con_supint = Counter()           # region -> legs con >=1 SUPINT/SUPINTN
+        sup_con_supnal = Counter()           # region -> legs con >=1 SUPNAL
+        sup_sin_ninguno = Counter()          # region -> legs sin ningun supervisor
 
         for d in leg_map.values():
-            tipo = d["tipo"]
-            leg_totals[tipo] += 1
-            tiene_sup_intl = bool(d["cats"] & {"SUPINT", "SUPINTN"})
-            tiene_sup_nal = "SUPNAL" in d["cats"]
-            if not tiene_sup_intl and not tiene_sup_nal:
-                leg_sin_sup[tipo] += 1
+            region = d["region"]
+            cats = d["cat_counts"]
+            n_sup = cats.get("SUPINT", 0) + cats.get("SUPINTN", 0) + cats.get("SUPNAL", 0)
+            sup_total_legs[region] += 1
+            if n_sup == 0:
+                sup_sin_ninguno[region] += 1
+            elif n_sup == 1:
+                sup_dist[region][1] += 1
+            elif n_sup == 2:
+                sup_dist[region][2] += 1
+            else:
+                sup_dist[region]["3+"] += 1
+            if cats.get("SUPINT", 0) + cats.get("SUPINTN", 0) > 0:
+                sup_con_supint[region] += 1
+            if cats.get("SUPNAL", 0) > 0:
+                sup_con_supnal[region] += 1
 
-            esp_tot_d[tipo] += 1
+        # ---- Seccion 3: especialistas por region x flota ----
+        esp_tot_rf = Counter()   # (region, flota) -> total legs
+        esp_cov_rf = Counter()   # (region, flota) -> legs con especialista
+        for d in leg_map.values():
+            key = (d["region"], d["flota"])
+            esp_tot_rf[key] += 1
             if d["esp"]:
-                esp_cov_d[tipo] += 1
-            esp_tot_f[d["flota"]] += 1
-            if d["esp"]:
-                esp_cov_f[d["flota"]] += 1
+                esp_cov_rf[key] += 1
 
-        # ---- Seccion 4 y 5: viaticos / block time (LINEA con validacion) ----
+        # ---- Seccion 4 y 5: viaticos / block time (LINEA con validacion), con min/max nombrado ----
         kpi_base = kpi_df[kpi_df["HOMEBASE"] == base].copy()
 
         def estado_corregido(cid):
@@ -478,20 +576,36 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         linea["BLOCK_DEC"] = linea["BLOCK HOURS"].apply(hhmm_a_horas)
         linea["TARGET_BLOCK_DEC"] = linea["TARGET PER DIEM"].apply(hhmm_a_horas)
 
+        total_block_hours_base = linea["BLOCK_DEC"].sum()
+
         indicadores_viaticos = {}
         for cat in CATEGORIAS_ORDEN:
             g = linea[linea["CATEGORY"] == cat]
             if len(g) == 0:
                 continue
+            fila_min = g.loc[g["ALLOWANCES"].idxmin()]
+            fila_max = g.loc[g["ALLOWANCES"].idxmax()]
+            fila_bmin = g.loc[g["BLOCK_DEC"].idxmin()] if g["BLOCK_DEC"].notna().any() else None
+            fila_bmax = g.loc[g["BLOCK_DEC"].idxmax()] if g["BLOCK_DEC"].notna().any() else None
             indicadores_viaticos[cat] = {
                 "n": len(g),
                 "prom_allow": g["ALLOWANCES"].mean(),
                 "target_allow": g["TARGET ALLOWANCES"].mean(),
-                "min_allow": g["ALLOWANCES"].min(),
-                "max_allow": g["ALLOWANCES"].max(),
+                "min_allow": fila_min["ALLOWANCES"], "min_allow_nombre": fila_min["CREW MEMBER NAME"],
+                "max_allow": fila_max["ALLOWANCES"], "max_allow_nombre": fila_max["CREW MEMBER NAME"],
                 "prom_block": g["BLOCK_DEC"].mean(),
                 "target_block": g["TARGET_BLOCK_DEC"].mean(),
+                "min_block": fila_bmin["BLOCK_DEC"] if fila_bmin is not None else None,
+                "min_block_nombre": fila_bmin["CREW MEMBER NAME"] if fila_bmin is not None else "",
+                "max_block": fila_bmax["BLOCK_DEC"] if fila_bmax is not None else None,
+                "max_block_nombre": fila_bmax["CREW MEMBER NAME"] if fila_bmax is not None else "",
             }
+
+        if aeropuertos_sin_clasificar:
+            st.warning(
+                "⚠️ Estos aeropuertos no están en ninguna lista de continente y no se contaron en "
+                "ningún grupo regional (avísame para agregarlos): " + ", ".join(sorted(aeropuertos_sin_clasificar))
+            )
 
         # =====================================================================
         # ESCRIBIR EXCEL DE SALIDA
@@ -509,6 +623,7 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         BODY_FONT = Font(name=ARIAL, size=10)
         LABEL_FONT = Font(name=ARIAL, bold=True, size=10)
         NEUTRAL_FILL = PatternFill("solid", fgColor="F2F2F2")
+        NOTE_FONT = Font(name=ARIAL, italic=True, size=8, color="808080")
 
         def sc(coord, value, font=BODY_FONT, fill=None, numfmt=None):
             cell = ws[coord]
@@ -523,72 +638,98 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         row = 2
         sc(f"B{row}", f"TABLERO DE INDICADORES — BASE {base}", TITLE_FONT)
         row += 1
-        sc(f"B{row}", f"Generado {datetime.now().strftime('%Y-%m-%d %H:%M')}", Font(name=ARIAL, italic=True, size=9, color="808080"))
+        sc(f"B{row}", f"Generado {datetime.now().strftime('%Y-%m-%d %H:%M')} — DH excluidos de todos los cálculos", NOTE_FONT)
         row += 2
 
-        # Seccion 1
-        sc(f"B{row}", "1. SUPERVISORES POR VUELO — % de legs SIN supervisor", SECTION_FONT, SECTION_FILL)
+        # ---- Resumen operativo ----
+        sc(f"B{row}", "RESUMEN OPERATIVO DE LA BASE", SECTION_FONT, SECTION_FILL)
         row += 1
-        for i, h in enumerate(["TIPO DE DESTINO", "TOTAL LEGS", "% SIN SUPERVISOR"]):
+        sc(f"B{row}", "Total Block Hours de la base (LINEA)", LABEL_FONT)
+        sc(f"C{row}", round(total_block_hours_base, 2) if pd.notna(total_block_hours_base) else None)
+        row += 2
+
+        sc(f"B{row}", "LEGS ÚNICOS POR AVIÓN (FLOTA) — cada leg cuenta 1 sola vez, sin DH", LABEL_FONT)
+        row += 1
+        sc(f"B{row}", "FLOTA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"C{row}", "TOTAL LEGS", SUBHEAD_FONT, SUBHEAD_FILL)
+        row += 1
+        for flota in ["B787", "A330", "A320", "ATR72", "737MAX", "OTRO"]:
+            n = legs_por_flota.get(flota, 0)
+            if n == 0:
+                continue
+            sc(f"B{row}", flota)
+            sc(f"C{row}", n)
+            row += 1
+        sc(f"B{row}", "TOTAL BASE (todas las flotas, sin DH)", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"C{row}", total_legs_base, LABEL_FONT, NEUTRAL_FILL)
+        row += 2
+
+        # ---- Seccion 1: Supervisores ----
+        sc(f"B{row}", "1. SUPERVISORES POR VUELO — distribución y cobertura por continente", SECTION_FONT, SECTION_FILL)
+        row += 1
+        headers1 = ["CONTINENTE", "TOTAL LEGS", "LEGS 1 SUP.", "LEGS 2 SUP.", "LEGS 3+ SUP.",
+                    "LEGS SIN SUP.", "% COBERTURA SUPINT", "% COBERTURA SUPNAL"]
+        for i, h in enumerate(headers1):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
-        tot_g, sin_g = 0, 0
-        for tipo in ["AMERICA", "EUROPA", "NACIONAL"]:
-            tot = leg_totals.get(tipo, 0)
-            sin_ = leg_sin_sup.get(tipo, 0)
-            tot_g += tot
-            sin_g += sin_
-            sc(f"B{row}", tipo)
+        for region in REGIONES_ORDEN:
+            tot = sup_total_legs.get(region, 0)
+            if tot == 0:
+                continue
+            sc(f"B{row}", REGIONES_LABEL[region])
             sc(f"C{row}", tot)
-            sc(f"D{row}", (sin_ / tot) if tot else None, numfmt="0.0%")
+            sc(f"D{row}", sup_dist[region].get(1, 0))
+            sc(f"E{row}", sup_dist[region].get(2, 0))
+            sc(f"F{row}", sup_dist[region].get("3+", 0))
+            sc(f"G{row}", sup_sin_ninguno.get(region, 0))
+            sc(f"H{row}", sup_con_supint.get(region, 0) / tot, numfmt="0.0%")
+            sc(f"I{row}", sup_con_supnal.get(region, 0) / tot, numfmt="0.0%")
             row += 1
-        sc(f"B{row}", "TOTAL", LABEL_FONT, NEUTRAL_FILL)
-        sc(f"C{row}", tot_g, LABEL_FONT, NEUTRAL_FILL)
-        sc(f"D{row}", (sin_g / tot_g) if tot_g else None, LABEL_FONT, NEUTRAL_FILL, "0.0%")
-        row += 3
+        row += 2
 
-        # Seccion 2
-        sc(f"B{row}", "2. VUELOS POR CATEGORÍA (cantidad de legs)", SECTION_FONT, SECTION_FILL)
+        # ---- Seccion 2: Vuelos por categoria x continente ----
+        sc(f"B{row}", "2. VUELOS POR CATEGORÍA (cantidad de asignaciones tripulante-leg)", SECTION_FONT, SECTION_FILL)
         row += 1
-        for i, h in enumerate(["CATEGORIA", "EUROPA", "AMERICA", "NACIONAL"]):
+        headers2 = ["CATEGORIA"] + [REGIONES_LABEL[r] for r in REGIONES_ORDEN]
+        for i, h in enumerate(headers2):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
         for cat in CATEGORIAS_ORDEN:
             sc(f"B{row}", cat)
-            sc(f"C{row}", cat_legs.get((cat, "EUROPA"), 0))
-            sc(f"D{row}", cat_legs.get((cat, "AMERICA"), 0))
-            sc(f"E{row}", cat_legs.get((cat, "NACIONAL"), 0))
+            for i, region in enumerate(REGIONES_ORDEN):
+                sc(f"{get_column_letter(3+i)}{row}", cat_legs.get((cat, region), 0))
             row += 1
         row += 2
 
-        # Seccion 3
-        sc(f"B{row}", "3. ESPECIALISTAS — % de cobertura", SECTION_FONT, SECTION_FILL)
+        # ---- Seccion 3: Especialistas por continente x flota ----
+        sc(f"B{row}", "3. ESPECIALISTAS — % de cobertura por continente y flota", SECTION_FONT, SECTION_FILL)
         row += 1
-        for i, h in enumerate(["TIPO / FLOTA", "TOTAL LEGS", "% COBERTURA"]):
+        flotas_orden = ["B787", "A330", "A320"]
+        headers3 = ["CONTINENTE"] + [f"{f} - LEGS" for f in flotas_orden] + [f"{f} - % COB." for f in flotas_orden]
+        for i, h in enumerate(headers3):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
-        for tipo in ["AMERICA", "EUROPA", "NACIONAL"]:
-            tot = esp_tot_d.get(tipo, 0)
-            cov = esp_cov_d.get(tipo, 0)
-            sc(f"B{row}", tipo)
-            sc(f"C{row}", tot)
-            sc(f"D{row}", (cov / tot) if tot else None, numfmt="0.0%")
-            row += 1
-        for flota in ["B787", "A320", "A330", "ATR72", "737MAX"]:
-            tot = esp_tot_f.get(flota, 0)
-            if tot == 0:
+        for region in REGIONES_ORDEN:
+            fila_vals = [esp_tot_rf.get((region, f), 0) for f in flotas_orden]
+            if sum(fila_vals) == 0:
                 continue
-            cov = esp_cov_f.get(flota, 0)
-            sc(f"B{row}", flota)
-            sc(f"C{row}", tot)
-            sc(f"D{row}", cov / tot, numfmt="0.0%")
+            sc(f"B{row}", REGIONES_LABEL[region])
+            for i, f in enumerate(flotas_orden):
+                tot = esp_tot_rf.get((region, f), 0)
+                sc(f"{get_column_letter(3+i)}{row}", tot)
+            for i, f in enumerate(flotas_orden):
+                tot = esp_tot_rf.get((region, f), 0)
+                cov = esp_cov_rf.get((region, f), 0)
+                sc(f"{get_column_letter(3+len(flotas_orden)+i)}{row}", (cov/tot) if tot else None, numfmt="0.0%")
             row += 1
         row += 2
 
-        # Seccion 4
+        # ---- Seccion 4: Viaticos ----
         sc(f"B{row}", "4. VIÁTICOS (ALLOWANCES) — solo ESTADO = LINEA (con validación aplicada)", SECTION_FONT, SECTION_FILL)
         row += 1
-        for i, h in enumerate(["CATEGORIA", "N", "PROMEDIO ($)", "TARGET PROM ($)", "MINIMO ($)", "MAXIMO ($)"]):
+        headers4 = ["CATEGORIA", "N", "PROMEDIO ($)", "TARGET PROM ($)",
+                    "MÍNIMO ($)", "TRIPULANTE (MENOR)", "MÁXIMO ($)", "TRIPULANTE (MAYOR)"]
+        for i, h in enumerate(headers4):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
         for cat in CATEGORIAS_ORDEN:
@@ -600,14 +741,18 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             sc(f"D{row}", d["prom_allow"], numfmt="$#,##0.00")
             sc(f"E{row}", d["target_allow"], numfmt="$#,##0.00")
             sc(f"F{row}", d["min_allow"], numfmt="$#,##0.00")
-            sc(f"G{row}", d["max_allow"], numfmt="$#,##0.00")
+            sc(f"G{row}", d["min_allow_nombre"])
+            sc(f"H{row}", d["max_allow"], numfmt="$#,##0.00")
+            sc(f"I{row}", d["max_allow_nombre"])
             row += 1
         row += 2
 
-        # Seccion 5
+        # ---- Seccion 5: Block time ----
         sc(f"B{row}", "5. BLOCK TIME (horas) — solo ESTADO = LINEA", SECTION_FONT, SECTION_FILL)
         row += 1
-        for i, h in enumerate(["CATEGORIA", "N", "PROMEDIO (h)", "TARGET PROM (h)"]):
+        headers5 = ["CATEGORIA", "N", "PROMEDIO (h)", "TARGET PROM (h)",
+                    "MÍNIMO (h)", "TRIPULANTE (MENOR)", "MÁXIMO (h)", "TRIPULANTE (MAYOR)"]
+        for i, h in enumerate(headers5):
             sc(f"{get_column_letter(2+i)}{row}", h, SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
         for cat in CATEGORIAS_ORDEN:
@@ -618,10 +763,14 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             sc(f"C{row}", d["n"])
             sc(f"D{row}", d["prom_block"], numfmt="0.00")
             sc(f"E{row}", d["target_block"], numfmt="0.00")
+            sc(f"F{row}", d["min_block"], numfmt="0.00")
+            sc(f"G{row}", d["min_block_nombre"])
+            sc(f"H{row}", d["max_block"], numfmt="0.00")
+            sc(f"I{row}", d["max_block_nombre"])
             row += 1
         row += 2
 
-        # Seccion Validacion
+        # ---- Seccion Validacion ----
         sc(f"B{row}", "VALIDACIÓN DE ESTADO (tripulantes LINEA con código especial detectado en el tx time)", SECTION_FONT, SECTION_FILL)
         row += 1
         for i, h in enumerate(["CREW ID", "CÓDIGO DETECTADO", "DÍAS"]):
@@ -634,7 +783,7 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                 sc(f"D{row}", dias)
                 row += 1
 
-        for col, w in zip("BCDEFG", [30, 14, 18, 16, 14, 14]):
+        for col, w in zip("BCDEFGHI", [34, 14, 18, 16, 12, 24, 12, 24]):
             ws.column_dimensions[col].width = w
 
         buffer = io.BytesIO()
