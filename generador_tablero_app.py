@@ -38,7 +38,7 @@ st.set_page_config(page_title="Generador de Tablero por Base", layout="centered"
 # CONSTANTES DE NEGOCIO
 # =========================================================================
 AEROPUERTOS_COLOMBIA = {
-    "ADZ", "AXM", "BAQ", "BGA", "BOG", "CLO", "CTG", "CUC", "IBE", "IPI",
+    "ADZ", "AXM", "BAQ", "BGA", "BOG", "CLO", "CTG", "CUC", "EJA", "IBE", "IPI",
     "LET", "MDE", "MTR", "NVA", "PEI", "PPN", "PSO", "RCH", "SMR", "VUP",
 }
 AEROPUERTOS_EUROPA = {"BCN", "CDG", "LHR", "MAD"}
@@ -133,6 +133,12 @@ se cuentan de forma única (fecha + vuelo + aeropuerto) — si un vuelo tiene 7
 tripulantes asignados, sigue contando como **1 solo leg**, no como 7. Se desglosan
 por flota (avión) cruzando el número de vuelo con la Flight List, y se excluyen
 siempre los DH.
+
+**Continentes:** cada vuelo se clasifica usando su **origen y destino reales**, tomados
+de la Flight List (columnas Dept Sta / Arvl Sta) — no solo del campo del tx time. Esto
+es importante porque el campo del tx time (PLEG) registra el **aeropuerto de origen**
+del leg, así que un vuelo que sale de BOG hacia el exterior aparece como "BOG" en el
+tx time y se clasificaría mal como Nacional si no se cruzara con la ruta real.
 
 **1. Supervisores por vuelo:** por cada leg único, se cuenta cuántos tripulantes de
 categoría SUPINT, SUPINTN o SUPNAL están asignados. Se agrupan los legs según si
@@ -378,6 +384,7 @@ st.caption("Debe tener una hoja llamada 'LT' con columnas de Equip y Flt Num")
 flota_file = st.file_uploader("Cargar Flight List", type=["xlsx"], key="flota")
 
 flt_flota = None
+flt_ruta = None
 if flota_file is not None:
     try:
         wb_f = openpyxl.load_workbook(flota_file, data_only=True)
@@ -392,19 +399,27 @@ if flota_file is not None:
         st.stop()
     ws_f = wb_f["LT"]
     headers = [c.value for c in ws_f[1]]
-    if "Equip" not in headers or "Flt Num" not in headers:
-        st.error("❌ La hoja 'LT' debe tener columnas llamadas 'Equip' y 'Flt Num'.")
+    columnas_flt_requeridas = ["Equip", "Flt Num", "Dept Sta", "Arvl Sta"]
+    faltantes_flt = [c for c in columnas_flt_requeridas if c not in headers]
+    if faltantes_flt:
+        st.error(f"❌ A la hoja 'LT' le faltan estas columnas: {', '.join(faltantes_flt)}.")
         st.stop()
 
     idx_equip = headers.index("Equip")
     idx_flt = headers.index("Flt Num")
+    idx_dept = headers.index("Dept Sta")
+    idx_arvl = headers.index("Arvl Sta")
     flt_equip_counts = defaultdict(Counter)
+    flt_ruta = {}
     for row in ws_f.iter_rows(min_row=2, values_only=True):
         flt = row[idx_flt]
         equip = row[idx_equip]
         if flt is None:
             continue
-        flt_equip_counts[int(flt)][equip] += 1
+        flt = int(flt)
+        flt_equip_counts[flt][equip] += 1
+        if flt not in flt_ruta:
+            flt_ruta[flt] = (row[idx_dept], row[idx_arvl])
 
     flt_flota = {}
     for flt, counter in flt_equip_counts.items():
@@ -414,7 +429,10 @@ if flota_file is not None:
     if len(flt_flota) == 0:
         st.error("❌ No encontré ningún número de vuelo válido en la hoja 'LT'.")
         st.stop()
-    st.success(f"✅ Flight List válida — {len(flt_flota):,} números de vuelo mapeados a flota.")
+    st.success(
+        f"✅ Flight List válida — {len(flt_flota):,} números de vuelo mapeados a flota y ruta "
+        f"(origen/destino real, para clasificar correctamente por continente)."
+    )
 
 if flt_flota is None:
     st.info("⬆️ Sube la Flight List para continuar.")
@@ -516,6 +534,31 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         leg_map = {}  # (fecha,vuelo,aeropuerto) -> {region, flota, cat_counts:Counter, esp:bool}
         cat_legs = Counter()  # (categoria, region) -> n asignaciones tripulante-leg
         aeropuertos_sin_clasificar = set()
+        vuelos_sin_ruta = set()
+
+        def region_de_vuelo(num_vuelo, aeropuerto_txtime):
+            """Determina la region real del vuelo usando el origen/destino verdadero
+            de la Flight List (Dept Sta / Arvl Sta), en vez de confiar solo en el
+            campo del tx time (que en PLEG resulta ser el AEROPUERTO DE ORIGEN del
+            leg, no el destino -- por eso un vuelo que SALE de BOG hacia el exterior
+            aparece con "BOG" en el tx time y se clasificaria mal como Nacional si
+            se usara ese campo solo)."""
+            ruta = flt_ruta.get(num_vuelo) if num_vuelo is not None else None
+            if ruta is None:
+                vuelos_sin_ruta.add(num_vuelo)
+                # sin dato de ruta: usamos el campo del tx time como respaldo
+                return region_aeropuerto(aeropuerto_txtime)
+            dept, arvl = ruta
+            r_dept = region_aeropuerto(dept) if dept else "SIN_CLASIFICAR"
+            r_arvl = region_aeropuerto(arvl) if arvl else "SIN_CLASIFICAR"
+            if r_dept not in ("NACIONAL", "SIN_CLASIFICAR"):
+                return r_dept
+            if r_arvl not in ("NACIONAL", "SIN_CLASIFICAR"):
+                return r_arvl
+            if "SIN_CLASIFICAR" in (r_dept, r_arvl):
+                aeropuertos_sin_clasificar.add(dept if r_dept == "SIN_CLASIFICAR" else arvl)
+                return "SIN_CLASIFICAR"
+            return "NACIONAL"
 
         for crew_id, legs in crew_legs.items():
             info = crew_info.get(crew_id)
@@ -528,18 +571,17 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             es_esp = crew_id in especialista_set
 
             for fecha, vuelo, aeropuerto in legs:
-                region = region_aeropuerto(aeropuerto)
-                if region == "SIN_CLASIFICAR":
-                    aeropuertos_sin_clasificar.add(aeropuerto)
+                try:
+                    num_vuelo = int(vuelo.split()[1])
+                except (IndexError, ValueError):
+                    num_vuelo = None
+
+                region = region_de_vuelo(num_vuelo, aeropuerto)
 
                 cat_legs[(categoria, region)] += 1
 
                 leg_key = (fecha, vuelo, aeropuerto)
                 if leg_key not in leg_map:
-                    try:
-                        num_vuelo = int(vuelo.split()[1])
-                    except (IndexError, ValueError):
-                        num_vuelo = None
                     flota = flt_flota.get(num_vuelo, "OTRO")
                     leg_map[leg_key] = {"region": region, "flota": flota, "cat_counts": Counter(), "esp": False}
                 leg_map[leg_key]["cat_counts"][categoria] += 1
@@ -630,7 +672,14 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         if aeropuertos_sin_clasificar:
             st.warning(
                 "⚠️ Estos aeropuertos no están en ninguna lista de continente y no se contaron en "
-                "ningún grupo regional (avísame para agregarlos): " + ", ".join(sorted(aeropuertos_sin_clasificar))
+                "ningún grupo regional (avísame para agregarlos): " + ", ".join(sorted(x for x in aeropuertos_sin_clasificar if x))
+            )
+        if vuelos_sin_ruta:
+            st.warning(
+                f"⚠️ {len(vuelos_sin_ruta):,} número(s) de vuelo no se encontraron en la Flight List "
+                "(no se pudo determinar su ruta real), así que se clasificaron usando el campo del tx time "
+                "como respaldo — esto puede ser menos preciso. Números: " +
+                ", ".join(str(v) for v in sorted(vuelos_sin_ruta) if v is not None)
             )
 
         # =====================================================================
