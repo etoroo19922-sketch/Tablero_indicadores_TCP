@@ -177,8 +177,8 @@ st.divider()
 # =========================================================================
 # PASO 1: tx time (.nlc)
 # =========================================================================
-st.subheader("2️⃣ Tx time (.nlc)")
-st.caption("El archivo de texto de programación de tripulantes, ej. JCR_AV_CCALL_8_..._estoro.nlc")
+st.subheader("2️⃣ TXT (exportación JEP → NLC)")
+st.caption("El archivo de texto que se genera al exportar la programación desde JEP a formato NLC. Debe ser el archivo con extensión **.nlc**, sin abrir ni modificar en Excel.")
 nlc_file = st.file_uploader("Cargar archivo .nlc", type=["nlc", "txt"], key="nlc")
 
 lineas_nlc = None
@@ -238,8 +238,8 @@ st.divider()
 # =========================================================================
 # PASO 2: KPI
 # =========================================================================
-st.subheader("3️⃣ Reporte KPI (.xls / .xlsx)")
-st.caption("El reporte con ALLOWANCES, TARGET ALLOWANCES, BLOCK HOURS, HOMEBASE, etc. (hoja 'JCR KPIs Report')")
+st.subheader("3️⃣ Reporte KPI")
+st.caption("Se genera junto con el **CTF del mismo escenario** a revisar. Se descarga en Excel y **se procesa sin ninguna modificación** antes de cargarlo aquí. Debe tener la hoja 'JCR KPIs Report'.")
 kpi_file = st.file_uploader("Cargar reporte KPI", type=["xls", "xlsx"], key="kpi")
 
 kpi_df = None
@@ -288,7 +288,7 @@ st.divider()
 # PASO 3: ESTADOS
 # =========================================================================
 st.subheader("4️⃣ ESTADOS (.xlsx)")
-st.caption("Archivo con el estado de cada tripulante — columna B = Crew ID, columna G = ESTADO")
+st.caption("Archivo con el **estado de cada tripulante para el mes que se va a analizar**. Debe mantener siempre el mismo formato: columna B = Crew ID, columna G = ESTADO, con encabezados en la fila 1.")
 estados_file = st.file_uploader("Cargar archivo de ESTADOS", type=["xlsx"], key="estados")
 
 estado_map = None
@@ -328,8 +328,8 @@ st.divider()
 # =========================================================================
 # PASO 4: Planta / RPT_TRIPULACIÓN
 # =========================================================================
-st.subheader("5️⃣ Planta / RPT_TRIPULACIÓN (.xlsx)")
-st.caption("Columnas: CREW CODE, CATEGORIA, APELLIDO, NOMBRE, HOME BASE")
+st.subheader("5️⃣ Planta activa (Fly Up)")
+st.caption("Reporte de planta activa descargado directamente de **Fly Up**, sin ninguna modificación. Columnas: CREW CODE, CATEGORIA, APELLIDO, NOMBRE, HOME BASE.")
 planta_file = st.file_uploader("Cargar archivo de planta", type=["xlsx"], key="planta")
 
 crew_info = None
@@ -379,8 +379,8 @@ st.divider()
 # =========================================================================
 # PASO 5: Lista de vuelos / Flight List
 # =========================================================================
-st.subheader("6️⃣ Lista de vuelos / Flight List (.xlsx)")
-st.caption("Debe tener una hoja llamada 'LT' con columnas de Equip y Flt Num")
+st.subheader("6️⃣ Flight List (SSIM — Itinerarios)")
+st.caption("El archivo de Flight List que llega por correo del equipo de **Itinerarios** cuando comparten el SSIM. Debe tener la hoja 'LT' con columnas Equip, Flt Num, Dept Sta, Arvl Sta.")
 flota_file = st.file_uploader("Cargar Flight List", type=["xlsx"], key="flota")
 
 flt_flota = None
@@ -442,8 +442,8 @@ st.divider()
 # =========================================================================
 # PASO 6: Especialistas
 # =========================================================================
-st.subheader("7️⃣ Especialistas (.xlsx)")
-st.caption("Lista simple de Crew ID de tripulantes especialistas (columna A)")
+st.subheader("7️⃣ Especialistas (MINT)")
+st.caption("Listado descargado de **MINT**, incluyendo únicamente las categorías que aplican como especialistas para el roster. Columna A = Crew ID.")
 esp_file = st.file_uploader("Cargar lista de especialistas", type=["xlsx"], key="especialistas")
 
 especialista_set = None
@@ -471,66 +471,152 @@ if especialista_set is None:
 st.divider()
 
 # =========================================================================
+# PASO 7.5: Deteccion y clasificacion manual de aeropuertos desconocidos
+# =========================================================================
+if "aeropuertos_manuales" not in st.session_state:
+    st.session_state["aeropuertos_manuales"] = {}
+
+def region_aeropuerto_con_manual(aeropuerto):
+    """Igual que region_aeropuerto, pero primero revisa si el usuario ya
+    clasifico manualmente este codigo en la sesion actual."""
+    if aeropuerto is None:
+        return "SIN_CLASIFICAR"
+    a = aeropuerto.strip().upper()
+    manual = st.session_state["aeropuertos_manuales"].get(a)
+    if manual:
+        return manual
+    return region_aeropuerto(a)
+
+@st.cache_data(show_spinner=False)
+def parsear_tx_time(lineas_nlc_tuple):
+    """Parsea el tx time una sola vez (cacheado): separa la seccion de patrones
+    de vuelo (PPRG/PLEG) de la seccion de roster (RABS/RPRG/RROL/RFTR), excluyendo
+    siempre los DH (PFTR en patrones, RFTR en roster)."""
+    lineas_nlc = list(lineas_nlc_tuple)
+    boundary = None
+    for i, l in enumerate(lineas_nlc):
+        if l.startswith(("RABS", "RPRG", "RROL", "RFTR")):
+            boundary = i
+            break
+
+    nl_flights = defaultdict(list)
+    cur_nl = None
+    for l in lineas_nlc[:boundary]:
+        if not l.strip():
+            continue
+        p = l.split("|")
+        if p[0] == "PPRG" and len(p) > 14:
+            cur_nl = p[14]
+        elif p[0] == "PLEG" and cur_nl and len(p) > 3:
+            nl_flights[cur_nl].append((p[1], p[2].strip(), p[3].strip()))
+
+    crew_legs = defaultdict(list)
+    crew_code_days = defaultdict(Counter)
+    cur_crew = None
+    for l in lineas_nlc[boundary:]:
+        if not l.strip():
+            continue
+        q = l.split("|")
+        tipo = q[0]
+        if tipo == "RABS":
+            cur_crew = q[1]
+            if len(q) > 5 and q[5] in CODIGOS_ESPECIALES:
+                crew_code_days[cur_crew][q[5]] += 1
+        elif tipo == "RPRG":
+            cur_crew = q[1]
+            if len(q) > 3:
+                for ev in nl_flights.get(q[3], []):
+                    crew_legs[cur_crew].append(ev)
+        elif tipo == "RFTR":
+            cur_crew = q[1]
+        elif tipo == "RROL":
+            cur_crew = q[1]
+            if len(q) > 5 and q[2] == "L":
+                crew_legs[cur_crew].append((q[3], q[4].strip(), q[5].strip()))
+
+    validacion_estado = {}
+    for cid, counter in crew_code_days.items():
+        mejor_codigo, dias = counter.most_common(1)[0]
+        validacion_estado[cid] = (mejor_codigo, dias)
+
+    return dict(crew_legs), validacion_estado
+
+crew_legs, validacion_estado = parsear_tx_time(tuple(lineas_nlc))
+kpi_homebase_map = dict(zip(kpi_df["CREW ID"], kpi_df["HOMEBASE"]))
+
+# Pre-escaneo: solo aeropuertos/vuelos que SI aplican a la base elegida
+codigos_en_uso = set()
+for crew_id, legs in crew_legs.items():
+    info = crew_info.get(crew_id)
+    if info is None:
+        continue
+    hb = kpi_homebase_map.get(crew_id, info["home_base"])
+    if hb != base:
+        continue
+    for fecha, vuelo, aeropuerto in legs:
+        codigos_en_uso.add(aeropuerto.strip().upper())
+        try:
+            num_vuelo = int(vuelo.split()[1])
+        except (IndexError, ValueError):
+            num_vuelo = None
+        ruta = flt_ruta.get(num_vuelo)
+        if ruta:
+            if ruta[0]:
+                codigos_en_uso.add(str(ruta[0]).strip().upper())
+            if ruta[1]:
+                codigos_en_uso.add(str(ruta[1]).strip().upper())
+
+codigos_desconocidos = sorted(
+    c for c in codigos_en_uso
+    if region_aeropuerto_con_manual(c) == "SIN_CLASIFICAR"
+)
+
+if codigos_desconocidos:
+    st.subheader("7.5️⃣ Aeropuertos sin clasificar")
+    st.warning(
+        f"⚠️ Encontré {len(codigos_desconocidos)} código(s) de aeropuerto que no están en ninguna "
+        "lista de continente. Clasifícalos abajo antes de generar el tablero — así no se pierde "
+        "ningún leg de la clasificación por continente."
+    )
+    with st.form("form_aeropuertos_desconocidos"):
+        opciones_continente = ["NORTEAMERICA", "CENTROAMERICA", "CARIBE", "SURAMERICA",
+                                "EUROPA", "OTRO_CONTINENTE", "NACIONAL"]
+        labels_continente = {
+            "NORTEAMERICA": "Norteamérica (USA/Canadá)", "CENTROAMERICA": "Centroamérica (incl. México)",
+            "CARIBE": "Caribe", "SURAMERICA": "Suramérica", "EUROPA": "Europa",
+            "OTRO_CONTINENTE": "Otro Continente", "NACIONAL": "Nacional (Colombia)",
+        }
+        respuestas = {}
+        for codigo in codigos_desconocidos:
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                st.text_input("Código", value=codigo, disabled=True, key=f"cod_{codigo}")
+            with col2:
+                pais = st.text_input(f"País de {codigo}", key=f"pais_{codigo}")
+                continente = st.selectbox(
+                    f"Continente/región de {codigo}", opciones_continente,
+                    format_func=lambda x: labels_continente[x], key=f"cont_{codigo}"
+                )
+                respuestas[codigo] = continente
+        enviado = st.form_submit_button("✅ Confirmar clasificación")
+        if enviado:
+            for codigo, continente in respuestas.items():
+                st.session_state["aeropuertos_manuales"][codigo] = continente
+            st.success("Clasificación guardada. Ya puedes generar el tablero abajo.")
+            st.rerun()
+    st.stop()
+
+st.divider()
+
+# =========================================================================
 # PROCESAMIENTO PRINCIPAL
 # =========================================================================
 st.subheader("8️⃣ Generar tablero")
 
 if st.button("🚀 Generar tablero de indicadores", type="primary"):
-    with st.spinner("Parseando el tx time y calculando indicadores... esto puede tardar 1-2 minutos"):
+    with st.spinner("Calculando indicadores..."):
 
-        # ---- Parsear el tx time (excluyendo DH: PFTR / RFTR) ----
-        boundary = None
-        for i, l in enumerate(lineas_nlc):
-            if l.startswith(("RABS", "RPRG", "RROL", "RFTR")):
-                boundary = i
-                break
 
-        nl_flights = defaultdict(list)
-        cur_nl = None
-        for l in lineas_nlc[:boundary]:
-            if not l.strip():
-                continue
-            p = l.split("|")
-            if p[0] == "PPRG" and len(p) > 14:
-                cur_nl = p[14]
-            elif p[0] == "PLEG" and cur_nl and len(p) > 3:
-                # PLEG = leg operado. PFTR (DH) se ignora a proposito.
-                nl_flights[cur_nl].append((p[1], p[2].strip(), p[3].strip()))
-
-        crew_legs = defaultdict(list)
-        crew_code_days = defaultdict(Counter)
-        cur_crew = None
-        for l in lineas_nlc[boundary:]:
-            if not l.strip():
-                continue
-            q = l.split("|")
-            tipo = q[0]
-            if tipo == "RABS":
-                cur_crew = q[1]
-                if len(q) > 5 and q[5] in CODIGOS_ESPECIALES:
-                    crew_code_days[cur_crew][q[5]] += 1
-            elif tipo == "RPRG":
-                cur_crew = q[1]
-                if len(q) > 3:
-                    for ev in nl_flights.get(q[3], []):
-                        crew_legs[cur_crew].append(ev)
-            elif tipo == "RFTR":
-                # RFTR = DH del tripulante. Se ignora a proposito.
-                cur_crew = q[1]
-            elif tipo == "RROL":
-                cur_crew = q[1]
-                if len(q) > 5 and q[2] == "L":
-                    crew_legs[cur_crew].append((q[3], q[4].strip(), q[5].strip()))
-
-        validacion_estado = {}
-        for cid, counter in crew_code_days.items():
-            mejor_codigo, dias = counter.most_common(1)[0]
-            validacion_estado[cid] = (mejor_codigo, dias)
-
-        # ---- Mapa de homebase preferente: KPI, con respaldo en planta ----
-        kpi_homebase_map = dict(zip(kpi_df["CREW ID"], kpi_df["HOMEBASE"]))
-
-        # ---- Recorrer legs y construir indicadores ----
         leg_map = {}  # (fecha,vuelo,aeropuerto) -> {region, flota, cat_counts:Counter, esp:bool}
         cat_legs = Counter()  # (categoria, region) -> n asignaciones tripulante-leg
         aeropuertos_sin_clasificar = set()
@@ -547,10 +633,10 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             if ruta is None:
                 vuelos_sin_ruta.add(num_vuelo)
                 # sin dato de ruta: usamos el campo del tx time como respaldo
-                return region_aeropuerto(aeropuerto_txtime)
+                return region_aeropuerto_con_manual(aeropuerto_txtime)
             dept, arvl = ruta
-            r_dept = region_aeropuerto(dept) if dept else "SIN_CLASIFICAR"
-            r_arvl = region_aeropuerto(arvl) if arvl else "SIN_CLASIFICAR"
+            r_dept = region_aeropuerto_con_manual(dept) if dept else "SIN_CLASIFICAR"
+            r_arvl = region_aeropuerto_con_manual(arvl) if arvl else "SIN_CLASIFICAR"
             if r_dept not in ("NACIONAL", "SIN_CLASIFICAR"):
                 return r_dept
             if r_arvl not in ("NACIONAL", "SIN_CLASIFICAR"):
