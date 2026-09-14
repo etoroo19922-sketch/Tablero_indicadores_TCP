@@ -165,6 +165,12 @@ por nombre a quien tiene el valor más bajo y más alto de cada categoría.
 **5. Block Time:** mismo tratamiento que Viáticos, pero con las columnas BLOCK HOURS
 y TARGET PER DIEM del reporte KPI (convertidas de HH:MM a horas decimales).
 
+**3.1 Análisis Europa (incluye AUH):** para los vuelos a Europa y Abu Dhabi (AUH),
+SOLO SUPINT y SUPINTN cuentan como supervisor válido — el SUPNAL en Europa NO cuenta.
+Muestra: cuántos legs a Europa/AUH lleva cada categoría, cuántos están cubiertos por
+supervisor internacional vs. sin cobertura, y un listado de los vuelos (fecha + número)
+que no tienen SUPINT/SUPINTN, con las categorías que sí llevaron.
+
 **Validación de estado:** revisa el tx time en busca de tripulantes marcados
 "LINEA" en el archivo de ESTADOS que en realidad tengan días con código ILLP, VAC,
 LUS, OFI, PSI, XMTR, MAT, XMAT u OFFICE_M — si los tiene, se usa ese código real en
@@ -717,6 +723,56 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             if d["esp"]:
                 esp_cov_rf[key] += 1
 
+        # ---- Seccion 3.1: ANALISIS EUROPA (incluye AUH) ----
+        # Regla especial: en Europa SOLO SUPINT/SUPINTN cuentan como supervisor valido.
+        # Un vuelo a Europa que solo lleve SUPNAL se considera SIN supervisor.
+        REGIONES_EUROPA_AMPLIADA = {"EUROPA", "OTRO_CONTINENTE"}  # AUH esta en OTRO_CONTINENTE
+        eur_total_legs = 0
+        eur_con_supint = 0        # legs con >=1 SUPINT o SUPINTN
+        eur_solo_intnal = 0       # legs SIN SUPINT/SUPINTN pero con INTNAL
+        eur_solo_supnal = 0       # legs SIN SUPINT/SUPINTN, solo SUPNAL (cuenta como sin supervisor)
+        eur_sin_ninguno = 0       # legs sin SUPINT/SUPINTN/INTNAL/SUPNAL
+        # desglose de cuantos legs llevan cada categoria (no excluyente)
+        eur_legs_con_categoria = Counter()   # categoria -> nro de legs que la llevan
+        # listado de vuelos a Europa SIN SUPINT/SUPINTN
+        eur_vuelos_sin_supint = []           # (fecha, vuelo, "cat1, cat2, ...")
+
+        for (fecha, vuelo, aeropuerto), d in leg_map.items():
+            if d["region"] not in REGIONES_EUROPA_AMPLIADA:
+                continue
+            cats = d["cat_counts"]
+            eur_total_legs += 1
+            tiene_supint = (cats.get("SUPINT", 0) + cats.get("SUPINTN", 0)) > 0
+            tiene_intnal = cats.get("INTNAL", 0) > 0
+            tiene_supnal = cats.get("SUPNAL", 0) > 0
+
+            for cat in CATEGORIAS_ORDEN:
+                if cats.get(cat, 0) > 0:
+                    eur_legs_con_categoria[cat] += 1
+
+            if tiene_supint:
+                eur_con_supint += 1
+            else:
+                # sin SUPINT/SUPINTN -> es un vuelo sin supervisor internacional valido
+                cats_presentes = ", ".join(f"{c}({cats[c]})" for c in CATEGORIAS_ORDEN if cats.get(c, 0) > 0)
+                eur_vuelos_sin_supint.append((fecha, vuelo.strip(), cats_presentes))
+                if tiene_intnal:
+                    eur_solo_intnal += 1
+                elif tiene_supnal:
+                    eur_solo_supnal += 1
+                else:
+                    eur_sin_ninguno += 1
+
+        # ordenar listado por fecha y luego numero de vuelo
+        def _sort_key_vuelo(item):
+            fecha, vuelo, _ = item
+            try:
+                num = int(vuelo.split()[1])
+            except (IndexError, ValueError):
+                num = 999999
+            return (fecha, num)
+        eur_vuelos_sin_supint.sort(key=_sort_key_vuelo)
+
         # ---- Seccion 4 y 5: viaticos / block time (LINEA con validacion), con min/max nombrado ----
         kpi_base = kpi_df[kpi_df["HOMEBASE"] == base].copy()
 
@@ -868,6 +924,10 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         sc(f"B{row}", "Nota: %SUPNAL solo cuenta los legs donde NO hay ya un supervisor internacional "
                       "(SUPINT/SUPINTN) — es decir, SUPNAL cubre como respaldo. Por eso %SUPINT + %SUPNAL + "
                       "(LEGS SIN SUP./TOTAL) = 100% en cada continente.", NOTE_FONT)
+        row += 1
+        sc(f"B{row}", "IMPORTANTE (Europa): en vuelos a Europa el SUPNAL NO cuenta como supervisor. Solo "
+                      "SUPINT/SUPINTN son supervisor válido. Ver el detalle en la Sección 3.1.",
+           Font(name=ARIAL, italic=True, bold=True, size=8, color="C00000"))
         row += 2
 
         # ---- Seccion 2: Vuelos por categoria x continente ----
@@ -904,6 +964,78 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                 tot = esp_tot_rf.get((region, f), 0)
                 cov = esp_cov_rf.get((region, f), 0)
                 sc(f"{get_column_letter(3+len(flotas_orden)+i)}{row}", (cov/tot) if tot else None, numfmt="0.0%")
+            row += 1
+        row += 2
+
+        # ---- Seccion 3.1: ANALISIS EUROPA (incluye AUH) ----
+        sc(f"B{row}", "3.1  ANÁLISIS EUROPA (incluye AUH) — cobertura de supervisión internacional", SECTION_FONT, SECTION_FILL)
+        row += 1
+        sc(f"B{row}", "Regla especial: en Europa/AUH SOLO cuentan como supervisor válido SUPINT y SUPINTN. "
+                      "Un vuelo que solo lleve SUPNAL se considera SIN supervisor internacional.", NOTE_FONT)
+        row += 2
+
+        # Tabla A: desglose de legs por categoria que llevo
+        sc(f"B{row}", "A) De los legs a Europa/AUH, ¿cuántos llevan cada categoría? (no excluyente)", LABEL_FONT)
+        row += 1
+        sc(f"B{row}", "CATEGORIA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"C{row}", "LEGS QUE LA LLEVAN", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"D{row}", "% DE LEGS A EUROPA", SUBHEAD_FONT, SUBHEAD_FILL)
+        row += 1
+        for cat in CATEGORIAS_ORDEN:
+            n = eur_legs_con_categoria.get(cat, 0)
+            sc(f"B{row}", cat)
+            sc(f"C{row}", n)
+            sc(f"D{row}", (n / eur_total_legs) if eur_total_legs else None, numfmt="0.0%")
+            row += 1
+        sc(f"B{row}", "TOTAL LEGS A EUROPA/AUH", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"C{row}", eur_total_legs, LABEL_FONT, NEUTRAL_FILL)
+        row += 2
+
+        # Tabla B: resumen de cobertura de supervision internacional
+        sc(f"B{row}", "B) Cobertura de supervisión internacional (SUPINT/SUPINTN) de los legs a Europa/AUH", LABEL_FONT)
+        row += 1
+        sc(f"B{row}", "CONDICIÓN", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"C{row}", "LEGS", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"D{row}", "% DEL TOTAL", SUBHEAD_FONT, SUBHEAD_FILL)
+        row += 1
+        filas_b = [
+            ("CON SUPINT / SUPINTN (cubiertos)", eur_con_supint),
+            ("SIN SUPINT/SUPINTN, pero con INTNAL", eur_solo_intnal),
+            ("SIN SUPINT/SUPINTN, solo SUPNAL (= sin supervisor)", eur_solo_supnal),
+            ("SIN SUPINT/SUPINTN/INTNAL/SUPNAL", eur_sin_ninguno),
+        ]
+        for etiqueta, n in filas_b:
+            sc(f"B{row}", etiqueta)
+            sc(f"C{row}", n)
+            sc(f"D{row}", (n / eur_total_legs) if eur_total_legs else None, numfmt="0.0%")
+            row += 1
+        sc(f"B{row}", "TOTAL LEGS A EUROPA/AUH", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"C{row}", eur_total_legs, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"D{row}", 1.0 if eur_total_legs else None, LABEL_FONT, NEUTRAL_FILL, "0.0%")
+        row += 1
+        legs_sin_supervisor_eur = eur_solo_intnal + eur_solo_supnal + eur_sin_ninguno
+        sc(f"B{row}", f"⚠️ LEGS A EUROPA/AUH SIN SUPERVISOR INTERNACIONAL (SUPINT/SUPINTN): {legs_sin_supervisor_eur}",
+           Font(name=ARIAL, bold=True, size=10, color="C00000"))
+        row += 2
+
+        # Tabla C: listado de vuelos a Europa SIN SUPINT/SUPINTN
+        sc(f"B{row}", "C) Listado de vuelos a Europa/AUH SIN SUPINT/SUPINTN (fecha, vuelo y categorías que llevó)", LABEL_FONT)
+        row += 1
+        if eur_vuelos_sin_supint:
+            sc(f"B{row}", "FECHA", SUBHEAD_FONT, SUBHEAD_FILL)
+            sc(f"C{row}", "VUELO", SUBHEAD_FONT, SUBHEAD_FILL)
+            sc(f"D{row}", "CATEGORÍAS QUE LLEVÓ (cantidad)", SUBHEAD_FONT, SUBHEAD_FILL)
+            row += 1
+            for fecha, vuelo, cats_txt in eur_vuelos_sin_supint:
+                # formatear fecha yyyymmdd -> dd/mm/yyyy
+                fecha_fmt = f"{fecha[6:8]}/{fecha[4:6]}/{fecha[0:4]}" if len(fecha) == 8 and fecha.isdigit() else fecha
+                sc(f"B{row}", fecha_fmt)
+                sc(f"C{row}", vuelo)
+                sc(f"D{row}", cats_txt)
+                row += 1
+        else:
+            sc(f"B{row}", "✅ Todos los vuelos a Europa/AUH tienen al menos un SUPINT o SUPINTN.",
+               Font(name=ARIAL, bold=True, size=10, color="006100"))
             row += 1
         row += 2
 
