@@ -89,18 +89,20 @@ def region_aeropuerto(aeropuerto):
 
 
 def fleet_group(equip):
+    """Mapea el codigo de equipo a la flota que se analiza.
+    Solo se analizan B787, A330 y A320 (con todas sus variantes de familia A320).
+    Cualquier otra flota (ATR72, 737MAX, etc.) devuelve None y sus legs se EXCLUYEN
+    del analisis, por decision de negocio."""
     equip = str(equip).strip().upper()
     if equip in ("788", "78N"):
         return "B787"
-    if equip == "320":
-        return "A320"
     if equip in ("333", "332"):
         return "A330"
-    if equip == "AT7":
-        return "ATR72"
-    if equip == "7M8":
-        return "737MAX"
-    return "OTRO"
+    # Familia A320 (incluye A320neo, A319, A321 y variantes): todos cuentan como A320
+    if equip in ("320", "32N", "319", "20H", "31J", "321", "32B", "32A"):
+        return "A320"
+    # ATR72 (AT7), 737MAX (7M8) y cualquier otro: NO se analizan -> se excluyen
+    return None
 
 
 def hhmm_a_horas(txt):
@@ -407,6 +409,7 @@ flota_file = st.file_uploader("Cargar Flight List", type=["xlsx"], key="flota")
 
 flt_flota = None
 flt_ruta = None
+flt_equip_por_dia = None
 if flota_file is not None:
     try:
         wb_f = openpyxl.load_workbook(flota_file, data_only=True)
@@ -431,8 +434,10 @@ if flota_file is not None:
     idx_flt = headers.index("Flt Num")
     idx_dept = headers.index("Dept Sta")
     idx_arvl = headers.index("Arvl Sta")
-    flt_equip_counts = defaultdict(Counter)
-    flt_ruta = {}
+    idx_day = headers.index("Day") if "Day" in headers else None
+    flt_equip_counts = defaultdict(Counter)      # num -> Counter de equipos (para respaldo/predominante)
+    flt_ruta = {}                                 # num -> (dept, arvl)
+    flt_equip_por_dia = {}                         # (yyyymmdd, num) -> equipo real de ese dia
     for row in ws_f.iter_rows(min_row=2, values_only=True):
         flt = row[idx_flt]
         equip = row[idx_equip]
@@ -442,18 +447,27 @@ if flota_file is not None:
         flt_equip_counts[flt][equip] += 1
         if flt not in flt_ruta:
             flt_ruta[flt] = (row[idx_dept], row[idx_arvl])
+        # equipo real por dia (clave: fecha del vuelo + numero)
+        if idx_day is not None and row[idx_day] is not None:
+            dia = row[idx_day]
+            try:
+                fecha_str = dia.strftime("%Y%m%d")
+            except AttributeError:
+                fecha_str = str(dia).replace("-", "")[:8]
+            flt_equip_por_dia[(fecha_str, flt)] = equip
 
+    # flota predominante del mes (respaldo cuando no hay dato del dia exacto)
     flt_flota = {}
     for flt, counter in flt_equip_counts.items():
         equip_top = counter.most_common(1)[0][0]
-        flt_flota[flt] = fleet_group(equip_top)
+        flt_flota[flt] = fleet_group(equip_top)   # puede ser None si es flota no analizada
 
     if len(flt_flota) == 0:
         st.error("❌ No encontré ningún número de vuelo válido en la hoja 'LT'.")
         st.stop()
     st.success(
-        f"✅ Flight List válida — {len(flt_flota):,} números de vuelo mapeados a flota y ruta "
-        f"(origen/destino real, para clasificar correctamente por continente)."
+        f"✅ Flight List válida — {len(flt_flota):,} números de vuelo con ruta y equipo por día "
+        f"(se usa el avión real de cada fecha; solo se analizan B787/A330/A320)."
     )
 
 if flt_flota is None:
@@ -761,13 +775,25 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                 except (IndexError, ValueError):
                     num_vuelo = None
 
+                # Flota REAL del dia: primero busca el equipo de esa fecha exacta;
+                # si no lo encuentra, usa el predominante del mes como respaldo.
+                equipo_dia = flt_equip_por_dia.get((fecha, num_vuelo)) if flt_equip_por_dia else None
+                if equipo_dia is not None:
+                    flota = fleet_group(equipo_dia)
+                else:
+                    flota = flt_flota.get(num_vuelo)   # predominante (puede ser None)
+
+                # Decision de negocio: solo se analizan B787/A330/A320.
+                # Los legs de otras flotas (ATR72, 737MAX, etc.) se EXCLUYEN por completo.
+                if flota is None:
+                    continue
+
                 region = region_de_vuelo(num_vuelo, aeropuerto)
 
                 cat_legs[(categoria, region)] += 1
 
                 leg_key = (fecha, vuelo, aeropuerto)
                 if leg_key not in leg_map:
-                    flota = flt_flota.get(num_vuelo, "OTRO")
                     leg_map[leg_key] = {"region": region, "flota": flota, "cat_counts": Counter(), "esp": False}
                 leg_map[leg_key]["cat_counts"][categoria] += 1
                 if es_esp:
@@ -977,17 +1003,21 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
 
         sc(f"B{row}", "LEGS ÚNICOS POR AVIÓN (FLOTA) — cada leg cuenta 1 sola vez, sin DH", LABEL_FONT)
         row += 1
+        sc(f"B{row}", "Solo se analizan B787, A330 y A320 (incluye A320neo/A319/A321). "
+                      "Los legs operados por ATR72, 737MAX u otra flota se EXCLUYEN del análisis. "
+                      "La flota es la del avión REAL de cada fecha (no la predominante del mes).", NOTE_FONT)
+        row += 1
         sc(f"B{row}", "FLOTA", SUBHEAD_FONT, SUBHEAD_FILL)
         sc(f"C{row}", "TOTAL LEGS", SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
-        for flota in ["B787", "A330", "A320", "ATR72", "737MAX", "OTRO"]:
+        for flota in ["B787", "A330", "A320"]:
             n = legs_por_flota.get(flota, 0)
             if n == 0:
                 continue
             sc(f"B{row}", flota)
             sc(f"C{row}", n)
             row += 1
-        sc(f"B{row}", "TOTAL BASE (todas las flotas, sin DH)", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"B{row}", "TOTAL BASE (B787+A330+A320, sin DH)", LABEL_FONT, NEUTRAL_FILL)
         sc(f"C{row}", total_legs_base, LABEL_FONT, NEUTRAL_FILL)
         row += 2
 
@@ -1109,7 +1139,7 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         sc(f"D{row}", "LEGS CON ESPECIALISTA", SUBHEAD_FONT, SUBHEAD_FILL)
         sc(f"E{row}", "% COBERTURA", SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
-        for flota in ["B787", "A330", "A320", "OTRO"]:
+        for flota in ["B787", "A330", "A320"]:
             t = eur_esp_tot_flota.get(flota, 0)
             if t == 0:
                 continue
