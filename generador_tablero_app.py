@@ -726,14 +726,18 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         # ---- Seccion 3.1: ANALISIS EUROPA (incluye AUH) ----
         # Regla especial: en Europa SOLO SUPINT/SUPINTN cuentan como supervisor valido.
         # Un vuelo a Europa que solo lleve SUPNAL se considera SIN supervisor.
+        # AUH (OTRO_CONTINENTE) se suma junto con Europa en TODO este analisis 3.1.
         REGIONES_EUROPA_AMPLIADA = {"EUROPA", "OTRO_CONTINENTE"}  # AUH esta en OTRO_CONTINENTE
         eur_total_legs = 0
         eur_con_supint = 0        # legs con >=1 SUPINT o SUPINTN
         eur_solo_intnal = 0       # legs SIN SUPINT/SUPINTN pero con INTNAL
         eur_solo_supnal = 0       # legs SIN SUPINT/SUPINTN, solo SUPNAL (cuenta como sin supervisor)
         eur_sin_ninguno = 0       # legs sin SUPINT/SUPINTN/INTNAL/SUPNAL
-        # desglose de cuantos legs llevan cada categoria (no excluyente)
-        eur_legs_con_categoria = Counter()   # categoria -> nro de legs que la llevan
+        # tabla A (nueva): legs con 2 o MAS de una misma categoria, sobre el total de legs
+        eur_legs_2plus_categoria = Counter()   # categoria -> nro de legs que llevan 2+ de esa categoria
+        # tabla especialistas Europa+AUH por flota
+        eur_esp_tot_flota = Counter()   # flota -> total legs
+        eur_esp_cov_flota = Counter()   # flota -> legs con especialista
         # listado de vuelos a Europa SIN SUPINT/SUPINTN
         eur_vuelos_sin_supint = []           # (fecha, vuelo, "cat1, cat2, ...")
 
@@ -747,13 +751,17 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             tiene_supnal = cats.get("SUPNAL", 0) > 0
 
             for cat in CATEGORIAS_ORDEN:
-                if cats.get(cat, 0) > 0:
-                    eur_legs_con_categoria[cat] += 1
+                if cats.get(cat, 0) >= 2:
+                    eur_legs_2plus_categoria[cat] += 1
+
+            # especialistas por flota (Europa+AUH)
+            eur_esp_tot_flota[d["flota"]] += 1
+            if d["esp"]:
+                eur_esp_cov_flota[d["flota"]] += 1
 
             if tiene_supint:
                 eur_con_supint += 1
             else:
-                # sin SUPINT/SUPINTN -> es un vuelo sin supervisor internacional valido
                 cats_presentes = ", ".join(f"{c}({cats[c]})" for c in CATEGORIAS_ORDEN if cats.get(c, 0) > 0)
                 eur_vuelos_sin_supint.append((fecha, vuelo.strip(), cats_presentes))
                 if tiene_intnal:
@@ -763,7 +771,6 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                 else:
                     eur_sin_ninguno += 1
 
-        # ordenar listado por fecha y luego numero de vuelo
         def _sort_key_vuelo(item):
             fecha, vuelo, _ = item
             try:
@@ -974,21 +981,49 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
                       "Un vuelo que solo lleve SUPNAL se considera SIN supervisor internacional.", NOTE_FONT)
         row += 2
 
-        # Tabla A: desglose de legs por categoria que llevo
-        sc(f"B{row}", "A) De los legs a Europa/AUH, ¿cuántos llevan cada categoría? (no excluyente)", LABEL_FONT)
+        # Tabla A: legs con 2 o MAS de una misma categoria (sobre el total de legs a Europa/AUH)
+        sc(f"B{row}", "A) De los legs a Europa/AUH, ¿cuántos llevan 2 o más tripulantes de una misma categoría?", LABEL_FONT)
+        row += 1
+        sc(f"B{row}", f"(Total de legs a Europa/AUH, sin DH: {eur_total_legs})", NOTE_FONT)
         row += 1
         sc(f"B{row}", "CATEGORIA", SUBHEAD_FONT, SUBHEAD_FILL)
-        sc(f"C{row}", "LEGS QUE LA LLEVAN", SUBHEAD_FONT, SUBHEAD_FILL)
-        sc(f"D{row}", "% DE LEGS A EUROPA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"C{row}", "LEGS CON 2+ DE ESA CATEGORÍA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"D{row}", "% SOBRE TOTAL LEGS EUROPA/AUH", SUBHEAD_FONT, SUBHEAD_FILL)
         row += 1
         for cat in CATEGORIAS_ORDEN:
-            n = eur_legs_con_categoria.get(cat, 0)
+            n = eur_legs_2plus_categoria.get(cat, 0)
             sc(f"B{row}", cat)
             sc(f"C{row}", n)
             sc(f"D{row}", (n / eur_total_legs) if eur_total_legs else None, numfmt="0.0%")
             row += 1
-        sc(f"B{row}", "TOTAL LEGS A EUROPA/AUH", LABEL_FONT, NEUTRAL_FILL)
-        sc(f"C{row}", eur_total_legs, LABEL_FONT, NEUTRAL_FILL)
+        sc(f"B{row}", "Nota: cada leg puede llevar 2+ de varias categorías, por eso estas filas NO se suman "
+                      "entre sí (no son excluyentes). El denominador de cada % es el total de legs a Europa/AUH.", NOTE_FONT)
+        row += 2
+
+        # Tabla A2: ESPECIALISTAS en Europa+AUH por flota
+        sc(f"B{row}", "A2) Especialistas en los legs a Europa/AUH, por flota", LABEL_FONT)
+        row += 1
+        sc(f"B{row}", "FLOTA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"C{row}", "TOTAL LEGS", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"D{row}", "LEGS CON ESPECIALISTA", SUBHEAD_FONT, SUBHEAD_FILL)
+        sc(f"E{row}", "% COBERTURA", SUBHEAD_FONT, SUBHEAD_FILL)
+        row += 1
+        for flota in ["B787", "A330", "A320", "OTRO"]:
+            t = eur_esp_tot_flota.get(flota, 0)
+            if t == 0:
+                continue
+            c = eur_esp_cov_flota.get(flota, 0)
+            sc(f"B{row}", flota)
+            sc(f"C{row}", t)
+            sc(f"D{row}", c)
+            sc(f"E{row}", (c / t) if t else None, numfmt="0.0%")
+            row += 1
+        sc(f"B{row}", "TOTAL EUROPA/AUH", LABEL_FONT, NEUTRAL_FILL)
+        sc(f"C{row}", sum(eur_esp_tot_flota.values()), LABEL_FONT, NEUTRAL_FILL)
+        sc(f"D{row}", sum(eur_esp_cov_flota.values()), LABEL_FONT, NEUTRAL_FILL)
+        _tot_eur_esp = sum(eur_esp_tot_flota.values())
+        sc(f"E{row}", (sum(eur_esp_cov_flota.values()) / _tot_eur_esp) if _tot_eur_esp else None,
+           LABEL_FONT, NEUTRAL_FILL, "0.0%")
         row += 2
 
         # Tabla B: resumen de cobertura de supervision internacional
