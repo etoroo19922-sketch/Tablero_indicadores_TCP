@@ -177,7 +177,15 @@ LUS, OFI, PSI, XMTR, MAT, XMAT u OFFICE_M — si los tiene, se usa ese código r
 vez de LINEA, y por lo tanto queda excluido de los cálculos de Viáticos y Block Time.
     """)
 
-base = st.selectbox("1️⃣ Elige la BASE a procesar", BASES_VALIDAS)
+base = st.selectbox("1️⃣ Elige la BASE a procesar", ["TODAS"] + BASES_VALIDAS)
+
+def base_coincide(homebase_valor):
+    """True si el homebase del tripulante entra en la seleccion actual.
+    Con 'TODAS' entra cualquier base valida; si no, solo la base exacta."""
+    if base == "TODAS":
+        return homebase_valor in BASES_VALIDAS
+    return homebase_valor == base
+
 st.divider()
 
 # =========================================================================
@@ -275,7 +283,10 @@ if kpi_file is not None:
         st.stop()
 
     kpi_df["CREW ID"] = kpi_df["CREW ID"].astype(str).str.strip()
-    n_base = (kpi_df["HOMEBASE"] == base).sum()
+    if base == "TODAS":
+        n_base = kpi_df["HOMEBASE"].isin(BASES_VALIDAS).sum()
+    else:
+        n_base = (kpi_df["HOMEBASE"] == base).sum()
     if n_base == 0:
         st.error(
             f"❌ No hay ningún tripulante con HOMEBASE = '{base}' en este archivo. "
@@ -283,7 +294,12 @@ if kpi_file is not None:
         )
         st.stop()
 
-    st.success(f"✅ KPI válido — {len(kpi_df):,} filas totales, {n_base:,} de la base {base}.")
+    if base == "TODAS":
+        bases_en_kpi = sorted(set(kpi_df["HOMEBASE"]) & set(BASES_VALIDAS))
+        st.success(f"✅ KPI válido — {len(kpi_df):,} filas totales, {n_base:,} en bases válidas "
+                   f"({', '.join(bases_en_kpi)}).")
+    else:
+        st.success(f"✅ KPI válido — {len(kpi_df):,} filas totales, {n_base:,} de la base {base}.")
 
 if kpi_df is None:
     st.info("⬆️ Sube el reporte KPI para continuar.")
@@ -368,7 +384,7 @@ if planta_file is not None:
             "home_base": row[idx["HOME BASE"]],
         }
 
-    n_base_planta = sum(1 for v in crew_info.values() if v["home_base"] == base)
+    n_base_planta = sum(1 for v in crew_info.values() if base_coincide(v["home_base"]))
     if n_base_planta == 0:
         st.warning(
             f"⚠️ No encontré tripulantes con HOME BASE = '{base}' en la planta. "
@@ -557,7 +573,7 @@ for crew_id, legs in crew_legs.items():
     if info is None:
         continue
     hb = kpi_homebase_map.get(crew_id, info["home_base"])
-    if hb != base:
+    if not base_coincide(hb):
         continue
     for fecha, vuelo, aeropuerto in legs:
         codigos_en_uso.add(aeropuerto.strip().upper())
@@ -615,6 +631,83 @@ if codigos_desconocidos:
 st.divider()
 
 # =========================================================================
+# PASO 7.9: RESUMEN / ALERTA DE LO QUE SE VA A PROCESAR
+# =========================================================================
+st.subheader("7.9️⃣ Resumen de lo que se va a procesar")
+
+# Construir el conjunto de tripulantes que efectivamente se van a procesar
+crew_procesados = {}   # crew_id -> (homebase, categoria)
+for crew_id, legs in crew_legs.items():
+    info = crew_info.get(crew_id)
+    if info is None:
+        continue
+    hb = kpi_homebase_map.get(crew_id, info["home_base"])
+    if not base_coincide(hb):
+        continue
+    crew_procesados[crew_id] = (hb, info["categoria"])
+
+# Bases presentes
+bases_presentes = sorted(set(hb for hb, _ in crew_procesados.values()))
+# Conteo por base
+conteo_base = Counter(hb for hb, _ in crew_procesados.values())
+# Conteo por categoria
+conteo_categoria = Counter(cat for _, cat in crew_procesados.values())
+# Conteo por base x categoria
+conteo_base_cat = Counter((hb, cat) for hb, cat in crew_procesados.values())
+
+if not crew_procesados:
+    st.error(
+        f"❌ No hay ningún tripulante que coincida con la selección '{base}'. "
+        "Revisa que el tx time, el KPI y la planta correspondan a la(s) base(s) esperada(s)."
+    )
+    st.stop()
+
+if base == "TODAS":
+    st.info(f"🌐 Modo **TODAS las bases** — se generará un solo Excel con la información de todas las bases que vienen en los archivos.")
+
+col_a, col_b, col_c = st.columns(3)
+col_a.metric("Bases a procesar", len(bases_presentes))
+col_b.metric("Categorías distintas", len(conteo_categoria))
+col_c.metric("Tripulantes a revisar", f"{len(crew_procesados):,}")
+
+st.markdown("**Bases que vienen en los archivos:** " + ", ".join(
+    f"{b} ({conteo_base[b]:,})" for b in bases_presentes
+))
+
+# Advertir si en modo base-especifica llegan otras bases en los archivos
+if base != "TODAS":
+    otras_bases_kpi = sorted(set(kpi_df["HOMEBASE"]) & set(BASES_VALIDAS) - {base})
+    if otras_bases_kpi:
+        st.warning(
+            f"⚠️ Los archivos también traen tripulantes de otras bases ({', '.join(otras_bases_kpi)}), "
+            f"pero como elegiste '{base}', esas se están **ignorando**. Si querías todas, elige 'TODAS' arriba."
+        )
+
+st.markdown("**Tripulantes por categoría (en la selección actual):**")
+tabla_cat = pd.DataFrame(
+    [{"Categoría": cat, "Tripulantes": conteo_categoria.get(cat, 0)}
+     for cat in ["SUPINT", "SUPINTN", "INTNAL", "SUPNAL", "AUXNAL"]
+     if conteo_categoria.get(cat, 0) > 0]
+    + [{"Categoría": cat, "Tripulantes": n} for cat, n in conteo_categoria.items()
+       if cat not in ("SUPINT", "SUPINTN", "INTNAL", "SUPNAL", "AUXNAL")]
+)
+st.dataframe(tabla_cat, use_container_width=True, hide_index=True)
+
+if base == "TODAS" and len(bases_presentes) > 1:
+    with st.expander("Ver desglose por base y categoría"):
+        filas_bc = []
+        for b in bases_presentes:
+            fila = {"Base": b}
+            for cat in ["SUPINT", "SUPINTN", "INTNAL", "SUPNAL", "AUXNAL"]:
+                fila[cat] = conteo_base_cat.get((b, cat), 0)
+            fila["TOTAL"] = conteo_base[b]
+            filas_bc.append(fila)
+        st.dataframe(pd.DataFrame(filas_bc), use_container_width=True, hide_index=True)
+
+st.caption("👉 Revisa que estas bases, categorías y cantidades sean las esperadas antes de generar el tablero.")
+st.divider()
+
+# =========================================================================
 # PROCESAMIENTO PRINCIPAL
 # =========================================================================
 st.subheader("8️⃣ Generar tablero")
@@ -657,7 +750,7 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             if info is None:
                 continue
             hb = kpi_homebase_map.get(crew_id, info["home_base"])
-            if hb != base:
+            if not base_coincide(hb):
                 continue
             categoria = info["categoria"]
             es_esp = crew_id in especialista_set
@@ -781,7 +874,10 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
         eur_vuelos_sin_supint.sort(key=_sort_key_vuelo)
 
         # ---- Seccion 4 y 5: viaticos / block time (LINEA con validacion), con min/max nombrado ----
-        kpi_base = kpi_df[kpi_df["HOMEBASE"] == base].copy()
+        if base == "TODAS":
+            kpi_base = kpi_df[kpi_df["HOMEBASE"].isin(BASES_VALIDAS)].copy()
+        else:
+            kpi_base = kpi_df[kpi_df["HOMEBASE"] == base].copy()
 
         def estado_corregido(cid):
             if cid in validacion_estado:
@@ -860,12 +956,17 @@ if st.button("🚀 Generar tablero de indicadores", type="primary"):
             return cell
 
         row = 2
-        sc(f"B{row}", f"TABLERO DE INDICADORES — BASE {base}", TITLE_FONT)
+        _titulo_base = "TODAS LAS BASES" if base == "TODAS" else f"BASE {base}"
+        sc(f"B{row}", f"TABLERO DE INDICADORES — {_titulo_base}", TITLE_FONT)
         row += 1
         sc(f"B{row}", f"Generado {datetime.now().strftime('%Y-%m-%d %H:%M')} — DH excluidos de todos los cálculos", NOTE_FONT)
         row += 1
         sc(f"B{row}", f"Archivo tx time usado: {nombre_archivo_nlc}  |  Periodo programado (FHDR): {periodo_txt}", NOTE_FONT)
-        row += 2
+        row += 1
+        if base == "TODAS":
+            sc(f"B{row}", f"Bases incluidas: {', '.join(bases_presentes)}  |  Tripulantes procesados: {len(crew_procesados):,}", NOTE_FONT)
+            row += 1
+        row += 1
 
         # ---- Resumen operativo ----
         sc(f"B{row}", "RESUMEN OPERATIVO DE LA BASE", SECTION_FONT, SECTION_FILL)
